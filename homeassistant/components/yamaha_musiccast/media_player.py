@@ -5,6 +5,7 @@ import voluptuous as vol
 
 from homeassistant.components.media_player import MediaPlayerDevice, PLATFORM_SCHEMA
 from homeassistant.components.media_player.const import (
+    DOMAIN,
     MEDIA_TYPE_MUSIC,
     SUPPORT_NEXT_TRACK,
     SUPPORT_PAUSE,
@@ -18,6 +19,7 @@ from homeassistant.components.media_player.const import (
     SUPPORT_VOLUME_SET,
 )
 from homeassistant.const import (
+    ATTR_ENTITY_ID,
     CONF_HOST,
     CONF_PORT,
     STATE_IDLE,
@@ -30,6 +32,9 @@ import homeassistant.helpers.config_validation as cv
 import homeassistant.util.dt as dt_util
 
 _LOGGER = logging.getLogger(__name__)
+
+SERVICE_JOIN = 'yamaha_musiccast_join'
+SERVICE_UNJOIN = 'yamaha_musiccast_unjoin'
 
 SUPPORTED_FEATURES = (
     SUPPORT_PLAY
@@ -44,11 +49,15 @@ SUPPORTED_FEATURES = (
     | SUPPORT_SELECT_SOURCE
 )
 
-KNOWN_HOSTS_KEY = "data_yamaha_musiccast"
+DATA_MUSICCAST = "data_yamaha_musiccast"
 INTERVAL_SECONDS = "interval_seconds"
 
 DEFAULT_PORT = 5005
 DEFAULT_INTERVAL = 480
+
+# Service call validation schemas
+ATTR_MASTER = 'master'
+ATTR_MUSICCAST_GROUP = 'yamaha_musiccast_group'
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     {
@@ -58,15 +67,38 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     }
 )
 
+MUSICCAST_SCHEMA = vol.Schema(
+    {
+        vol.Optional(ATTR_ENTITY_ID): cv.entity_ids,
+    }
+)
+
+MUSICCAST_JOIN_SCHEMA = MUSICCAST_SCHEMA.extend(
+    {
+        vol.Required(ATTR_MASTER): cv.entity_id,
+    }
+)
+
+
+class MusicCastData:
+    """Storage class for platform global data."""
+
+    def __init__(self):
+        """Initialize the data."""
+        self.hosts = []
+        self.entities = []
+
 
 def setup_platform(hass, config, add_entities, discovery_info=None):
     """Set up the Yamaha MusicCast platform."""
     import socket
-    import pymusiccast
+    # import pymusiccast
+    from .pymusiccast import pymusiccast
 
-    known_hosts = hass.data.get(KNOWN_HOSTS_KEY)
-    if known_hosts is None:
-        known_hosts = hass.data[KNOWN_HOSTS_KEY] = []
+    if DATA_MUSICCAST not in hass.data:
+        hass.data[DATA_MUSICCAST] = MusicCastData()
+
+    known_hosts = hass.data[DATA_MUSICCAST].hosts
     _LOGGER.debug("known_hosts: %s", known_hosts)
 
     host = config.get(CONF_HOST)
@@ -104,6 +136,47 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
     else:
         known_hosts.remove(reg_host)
 
+    def _service_to_entities(service):
+        """Extract and return musiccast entities from service call."""
+        entity_ids = service.data.get('entity_id')
+
+        entities = hass.data[DATA_MUSICCAST].entities
+        if entity_ids:
+            entities = [e for e in entities if e.entity_id in entity_ids]
+        return entities
+
+    def service_handle(service):
+        """Handle sync services."""
+        entities = _service_to_entities(service)
+        if service.service == SERVICE_JOIN:
+            master = [e for e in hass.data[DATA_MUSICCAST].entities
+                      if e.entity_id == service.data[ATTR_MASTER]]
+            if master:
+                client_entities = [e for e in entities
+                                   if e.entity_id != master[0].entity_id]
+                _LOGGER.debug("**JOIN** set clients %s for master %s",
+                              [e.entity_id for e in client_entities],
+                              master[0].ip_address)
+                master[0].join_add(client_entities)
+        elif service.service == SERVICE_UNJOIN:
+            _LOGGER.debug("**UNJOIN** entities: %s", entities)
+            masters = [entities for entities in entities
+                       if entities.is_master]
+            if masters:
+                for master in masters:
+                    master.unjoin()
+            else:
+                for entity in entities:
+                    entity.unjoin()
+
+    hass.services.register(
+        DOMAIN, SERVICE_JOIN, service_handle,
+        schema=MUSICCAST_JOIN_SCHEMA)
+
+    hass.services.register(
+        DOMAIN, SERVICE_UNJOIN, service_handle,
+        schema=MUSICCAST_SCHEMA)
+
 
 class YamahaDevice(MediaPlayerDevice):
     """Representation of a Yamaha MusicCast device."""
@@ -112,9 +185,11 @@ class YamahaDevice(MediaPlayerDevice):
         """Initialize the Yamaha MusicCast device."""
         self._recv = recv
         self._name = recv.name
+        self._ip_address = recv.ip_address
         self._source = None
         self._source_list = []
         self._zone = zone
+        self._musiccast_group = [self]
         self.mute = False
         self.media_status = None
         self.media_status_received = None
@@ -125,10 +200,24 @@ class YamahaDevice(MediaPlayerDevice):
         self._recv.set_yamaha_device(self)
         self._zone.set_yamaha_device(self)
 
+    async def async_added_to_hass(self):
+        """Record entity."""
+        self.hass.data[DATA_MUSICCAST].entities.append(self)
+
     @property
     def name(self):
         """Return the name of the device."""
         return "{} ({})".format(self._name, self._zone.zone_id)
+
+    @property
+    def ip_address(self):
+        """Return the ip address of the device."""
+        return "{}".format(self._ip_address)
+
+    @property
+    def zone(self):
+        """Return the zone of the device."""
+        return self._zone
 
     @property
     def state(self):
@@ -225,11 +314,22 @@ class YamahaDevice(MediaPlayerDevice):
         """
         return self.media_status_received if self.media_status else None
 
+    @property
+    def musiccast_group(self):
+        """Return the list of entities in the group."""
+        return self._musiccast_group
+
+    @property
+    def is_master(self):
+        """Return true if it is a master."""
+        return self._zone.group_is_server
+
     def update(self):
         """Get the latest details from the device."""
         _LOGGER.debug("update: %s", self.entity_id)
         self._recv.update_status()
         self._zone.update_status()
+        self.refresh_group()
 
     def update_hass(self):
         """Push updates to HASS."""
@@ -237,6 +337,7 @@ class YamahaDevice(MediaPlayerDevice):
             _LOGGER.debug("update_hass: pushing updates")
             self.schedule_update_ha_state()
             return True
+        return False
 
     def turn_on(self):
         """Turn on specified media player or all."""
@@ -294,3 +395,49 @@ class YamahaDevice(MediaPlayerDevice):
         _LOGGER.debug("new media_status arrived")
         self.media_status = status
         self.media_status_received = dt_util.utcnow()
+
+    def refresh_group(self):
+        """Refresh the entities that are part of the group."""
+        _LOGGER.debug("Refreshing group data for entity: %s", self.entity_id)
+        entities = self.hass.data[DATA_MUSICCAST].entities
+        client_entities = [e for e in entities
+                           if e.ip_address in self._zone.group_clients]
+        self._musiccast_group = [self] + client_entities
+
+    def update_master(self):
+        """Master must confirm its clients are alive."""
+        _LOGGER.debug("Calling to refresh the master: %s", self.entity_id)
+        masters = [e for e in self.hass.data[DATA_MUSICCAST].entities
+                   if len(e.musiccast_group) > 1]
+        for master in masters:
+            speakers_ip = [e.ip_address for e in master.musiccast_group]
+            if self._ip_address in speakers_ip:
+                master.zone.distribution_group_check_clients()
+                _LOGGER.debug("Refreshing the master: %s", master.entity_id)
+
+    def join_add(self, entities):
+        """Form a group by adding other players as clients."""
+        self._zone.distribution_group_add([e.ip_address for e in entities])
+
+    def unjoin(self):
+        """Remove this client from group. Remove the group if server."""
+        if self.is_master:
+            self._zone.distribution_group_stop()
+        else:
+            masters = [e for e in self.hass.data[DATA_MUSICCAST].entities
+                       if len(e.musiccast_group) > 1]
+            for master in masters:
+                _LOGGER.debug("The master %s needs to refresh after unjoin",
+                              master.entity_id)
+                speakers_ip = [e.ip_address for e in master.musiccast_group]
+                if self._ip_address in speakers_ip:
+                    master.zone.distribution_group_remove([self._ip_address])
+
+    @property
+    def device_state_attributes(self):
+        """Return entity specific state attributes."""
+        attributes = {
+            ATTR_MUSICCAST_GROUP: [e.entity_id for e
+                                   in self._musiccast_group],
+        }
+        return attributes
