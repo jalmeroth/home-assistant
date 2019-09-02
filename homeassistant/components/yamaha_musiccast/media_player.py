@@ -18,7 +18,6 @@ from homeassistant.components.media_player.const import (
     SUPPORT_VOLUME_SET,
 )
 from homeassistant.const import (
-    ATTR_ENTITY_ID,
     CONF_HOST,
     CONF_PORT,
     STATE_IDLE,
@@ -29,11 +28,7 @@ from homeassistant.const import (
 )
 import homeassistant.helpers.config_validation as cv
 import homeassistant.util.dt as dt_util
-from . import (
-    DOMAIN, 
-    SERVICE_JOIN, 
-    SERVICE_UNJOIN, 
-    ATTR_MASTER)
+from . import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -55,7 +50,7 @@ INTERVAL_SECONDS = "interval_seconds"
 DEFAULT_PORT = 5005
 DEFAULT_INTERVAL = 480
 
-# Service call validation schemas
+# Attribute schemas
 ATTR_MUSICCAST_GROUP = 'yamaha_musiccast_group'
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
@@ -66,8 +61,6 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     }
 )
 
-
-
 class MusicCastData:
     """Storage class for platform global data."""
 
@@ -75,7 +68,6 @@ class MusicCastData:
         """Initialize the data."""
         self.hosts = []
         self.entities = []
-
 
 def setup_platform(hass, config, add_entities, discovery_info=None):
     """Set up the Yamaha MusicCast platform."""
