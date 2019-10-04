@@ -3,7 +3,7 @@ import logging
 
 import voluptuous as vol
 
-from homeassistant.components.media_player import MediaPlayerDevice, PLATFORM_SCHEMA
+from homeassistant.components.media_player import PLATFORM_SCHEMA, MediaPlayerDevice
 from homeassistant.components.media_player.const import (
     MEDIA_TYPE_MUSIC,
     SUPPORT_NEXT_TRACK,
@@ -28,7 +28,14 @@ from homeassistant.const import (
 )
 import homeassistant.helpers.config_validation as cv
 import homeassistant.util.dt as dt_util
-from . import DOMAIN
+
+from .const import (
+    ATTR_MUSICCAST_GROUP,
+    DEFAULT_INTERVAL,
+    DEFAULT_PORT,
+    DOMAIN,
+    INTERVAL_SECONDS,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -45,14 +52,6 @@ SUPPORTED_FEATURES = (
     | SUPPORT_SELECT_SOURCE
 )
 
-INTERVAL_SECONDS = "interval_seconds"
-
-DEFAULT_PORT = 5005
-DEFAULT_INTERVAL = 480
-
-# Attribute schemas
-ATTR_MUSICCAST_GROUP = 'yamaha_musiccast_group'
-
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     {
         vol.Required(CONF_HOST): cv.string,
@@ -61,6 +60,7 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     }
 )
 
+
 class MusicCastData:
     """Storage class for platform global data."""
 
@@ -68,6 +68,9 @@ class MusicCastData:
         """Initialize the data."""
         self.hosts = []
         self.entities = []
+        self.devices = {}
+        self.groups = {}
+
 
 def setup_platform(hass, config, add_entities, discovery_info=None):
     """Set up the Yamaha MusicCast platform."""
@@ -103,7 +106,9 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
     known_hosts.append(reg_host)
 
     try:
-        receiver = pymusiccast.McDevice(ipaddr, udp_port=port, mc_interval=interval)
+        receiver = pymusiccast.McDevice(
+            ipaddr, udp_port=port, mc_interval=interval, hass=hass
+        )
     except pymusiccast.exceptions.YMCInitError as err:
         _LOGGER.error(err)
         receiver = None
@@ -114,6 +119,7 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
             add_entities([YamahaDevice(receiver, receiver.zones[zone])], True)
     else:
         known_hosts.remove(reg_host)
+
 
 class YamahaDevice(MediaPlayerDevice):
     """Representation of a Yamaha MusicCast device."""
@@ -126,7 +132,6 @@ class YamahaDevice(MediaPlayerDevice):
         self._source = None
         self._source_list = []
         self._zone = zone
-        self._musiccast_group = [self]
         self.mute = False
         self.media_status = None
         self.media_status_received = None
@@ -136,15 +141,18 @@ class YamahaDevice(MediaPlayerDevice):
         self.volume_max = 0
         self._recv.set_yamaha_device(self)
         self._zone.set_yamaha_device(self)
+        self.group_members = []
 
     async def async_added_to_hass(self):
-        """Record entity."""
+        """Record entity_id: entity."""
+        self.group_members.append(self.entity_id)
         self.hass.data[DOMAIN].entities.append(self)
+        self.hass.data[DOMAIN].devices[self.entity_id] = self
 
     @property
     def name(self):
         """Return the name of the device."""
-        return "{} ({})".format(self._name, self._zone.zone_id)
+        return f"{self._name} ({self._zone.zone_id})"
 
     @property
     def ip_address(self):
@@ -251,22 +259,11 @@ class YamahaDevice(MediaPlayerDevice):
         """
         return self.media_status_received if self.media_status else None
 
-    @property
-    def musiccast_group(self):
-        """Return the list of entities in the group."""
-        return self._musiccast_group
-
-    @property
-    def is_master(self):
-        """Return true if it is a master."""
-        return self._zone.group_is_server
-
     def update(self):
         """Get the latest details from the device."""
         _LOGGER.debug("update: %s", self.entity_id)
         self._recv.update_status()
         self._zone.update_status()
-        self.refresh_group()
 
     def update_hass(self):
         """Push updates to HASS."""
@@ -274,7 +271,6 @@ class YamahaDevice(MediaPlayerDevice):
             _LOGGER.debug("update_hass: pushing updates")
             self.schedule_update_ha_state()
             return True
-        return False
 
     def turn_on(self):
         """Turn on specified media player or all."""
@@ -333,48 +329,7 @@ class YamahaDevice(MediaPlayerDevice):
         self.media_status = status
         self.media_status_received = dt_util.utcnow()
 
-    def refresh_group(self):
-        """Refresh the entities that are part of the group."""
-        _LOGGER.debug("Refreshing group data for entity: %s", self.entity_id)
-        entities = self.hass.data[DOMAIN].entities
-        client_entities = [e for e in entities
-                           if e.ip_address in self._zone.group_clients]
-        self._musiccast_group = [self] + client_entities
-
-    def update_master(self):
-        """Master must confirm its clients are alive."""
-        _LOGGER.debug("Calling to refresh the master: %s", self.entity_id)
-        masters = [e for e in self.hass.data[DOMAIN].entities
-                   if len(e.musiccast_group) > 1]
-        for master in masters:
-            speakers_ip = [e.ip_address for e in master.musiccast_group]
-            if self._ip_address in speakers_ip:
-                master.zone.distribution_group_check_clients()
-                _LOGGER.debug("Refreshing the master: %s", master.entity_id)
-
-    def join_add(self, entities):
-        """Form a group by adding other players as clients."""
-        self._zone.distribution_group_add([e.ip_address for e in entities])
-
-    def unjoin(self):
-        """Remove this client from group. Remove the group if server."""
-        if self.is_master:
-            self._zone.distribution_group_stop()
-        else:
-            masters = [e for e in self.hass.data[DOMAIN].entities
-                       if len(e.musiccast_group) > 1]
-            for master in masters:
-                _LOGGER.debug("The master %s needs to refresh after unjoin",
-                              master.entity_id)
-                speakers_ip = [e.ip_address for e in master.musiccast_group]
-                if self._ip_address in speakers_ip:
-                    master.zone.distribution_group_remove([self._ip_address])
-
     @property
     def device_state_attributes(self):
         """Return entity specific state attributes."""
-        attributes = {
-            ATTR_MUSICCAST_GROUP: [e.entity_id for e
-                                   in self._musiccast_group],
-        }
-        return attributes
+        return {ATTR_MUSICCAST_GROUP: self.group_members}
